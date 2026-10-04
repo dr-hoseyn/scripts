@@ -1,0 +1,156 @@
+name: Fresh recovery validation (temporary)
+on:
+  push:
+    branches: [codex/backup-recovery-validation]
+permissions:
+  contents: read
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        database: [sqlite, mysql, mariadb, postgresql, timescaledb]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/backup-disaster-recovery
+          persist-credentials: false
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 jq rsync zip unzip
+          sudo curl -fsSL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o /usr/local/bin/yq
+          sudo chmod 755 /usr/local/bin/yq
+      - name: Recover after removing the source installation
+        env:
+          RECOVERY_ENGINE: ${{ matrix.database }}
+        run: |
+          cat > "$RUNNER_TEMP/recovery-smoke.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          engine="$RECOVERY_ENGINE"
+          root=$(mktemp -d /tmp/pasarguard-fresh-smoke.XXXXXX)
+          export APP_NAME="recovery-smoke-$engine" APP_DIR="$root/app" DATA_DIR="$root/data"
+          mkdir -p "$APP_DIR" "$DATA_DIR"
+          export PASARGUARD_SOURCE_ONLY=true
+          source "$GITHUB_WORKSPACE/pasarguard.sh"
+          detect_compose
+          image='' target='' dbservice=''
+          case "$engine" in
+            sqlite) url="sqlite+aiosqlite:////${DATA_DIR#/}/db.sqlite3" ;;
+            mysql) image=mysql:8.0; target=/var/lib/mysql; dbservice=mysql; url='mysql+asyncmy://appuser:fixture-password@127.0.0.1:3306/appdb' ;;
+            mariadb) image=mariadb:11.4; target=/var/lib/mysql; dbservice=mariadb; url='mysql+asyncmy://appuser:fixture-password@127.0.0.1:3306/appdb' ;;
+            postgresql) image=postgres:16; target=/var/lib/postgresql/data; dbservice=postgresql; url='postgresql+asyncpg://appuser:fixture-password@127.0.0.1:5432/appdb' ;;
+            timescaledb) image=timescale/timescaledb:2.27.2-pg17; target=/var/lib/postgresql/data; dbservice=timescaledb; url='postgresql+asyncpg://appuser:fixture-password@127.0.0.1:5432/appdb' ;;
+          esac
+          cat >"$ENV_FILE" <<EOF
+          BACKUP_SERVICE_ENABLED=false
+          MYSQL_ROOT_PASSWORD=fixture-password
+          DB_USER=appuser
+          DB_PASSWORD=fixture-password
+          DB_NAME=appdb
+          SQLALCHEMY_DATABASE_URL="$url"
+          EOF
+          cat >"$COMPOSE_FILE" <<EOF
+          services:
+            pasarguard:
+              image: alpine:3.20
+              command: ["sleep", "3600"]
+              env_file: .env
+              volumes:
+                - $DATA_DIR:/var/lib/pasarguard
+          EOF
+          if [ "$engine" != sqlite ]; then
+            cat >>"$COMPOSE_FILE" <<EOF
+            $dbservice:
+              image: $image
+              network_mode: host
+              environment:
+                MYSQL_ROOT_PASSWORD: fixture-password
+                MYSQL_DATABASE: appdb
+                MYSQL_USER: appuser
+                MYSQL_PASSWORD: fixture-password
+                POSTGRES_USER: appuser
+                POSTGRES_PASSWORD: fixture-password
+                POSTGRES_DB: appdb
+              volumes:
+                - $DATA_DIR/$dbservice:$target
+          EOF
+            case "$engine" in
+              mysql)
+                cat >>"$COMPOSE_FILE" <<'EOF'
+              healthcheck:
+                test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root --password=fixture-password"]
+                interval: 3s
+                timeout: 3s
+                retries: 60
+          EOF
+                ;;
+              mariadb)
+                cat >>"$COMPOSE_FILE" <<'EOF'
+              healthcheck:
+                test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+                interval: 3s
+                timeout: 3s
+                retries: 60
+          EOF
+                ;;
+              postgresql|timescaledb)
+                cat >>"$COMPOSE_FILE" <<'EOF'
+              healthcheck:
+                test: ["CMD", "pg_isready", "-U", "appuser", "-d", "appdb"]
+                interval: 3s
+                timeout: 3s
+                retries: 60
+          EOF
+                ;;
+            esac
+          fi
+          docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" up -d --wait --wait-timeout 240
+          cid=''
+          if [ "$engine" != sqlite ]; then cid=$(docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" ps -q "$dbservice"); fi
+          sql='CREATE TABLE ci_recovery (value integer); INSERT INTO ci_recovery VALUES (42); CREATE TABLE alembic_version (version_num varchar(32)); INSERT INTO alembic_version VALUES ('"'fixture_revision'"');'
+          case "$engine" in
+            sqlite) sqlite3 "$DATA_DIR/db.sqlite3" "PRAGMA journal_mode=WAL; $sql" ;;
+            mysql) docker exec -e MYSQL_PWD=fixture-password "$cid" mysql -u appuser appdb -e "$sql" ;;
+            mariadb) docker exec -e MYSQL_PWD=fixture-password "$cid" mariadb -u appuser appdb -e "$sql" ;;
+            postgresql|timescaledb)
+              if [ "$engine" = timescaledb ]; then docker exec -e PGPASSWORD=fixture-password "$cid" psql -U appuser -d appdb -c 'CREATE EXTENSION IF NOT EXISTS timescaledb;'; fi
+              docker exec -e PGPASSWORD=fixture-password "$cid" psql -U appuser -d appdb -v ON_ERROR_STOP=1 -c "$sql"
+              ;;
+          esac
+          printf 'original-state\n' >"$DATA_DIR/sentinel.txt"
+          backup_command
+          archive=$(find "$APP_DIR/backup" -maxdepth 1 -name '*.zip' | head -n1)
+          cp "$archive" "$root/recovery.zip"
+          unzip -p "$root/recovery.zip" backup-runtime.tsv
+          docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" down -v
+          # Rename only this isolated fixture's paths: emulate complete loss.
+          mv "$APP_DIR" "$root/lost-app"
+          mv "$DATA_DIR" "$root/lost-data"
+          (restore_command "$root/recovery.zip" --check)
+          test ! -e "$APP_DIR"
+          (restore_command "$root/recovery.zip" --fresh --yes)
+          test "$(cat "$DATA_DIR/sentinel.txt")" = original-state
+          yq eval -r '.services.pasarguard.image' "$COMPOSE_FILE" | grep -q '@sha256:'
+          if [ "$engine" != sqlite ]; then
+            yq eval -r ".services.$dbservice.image" "$COMPOSE_FILE" | grep -q '@sha256:'
+            cid=$(docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" ps -q "$dbservice")
+            docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" restart "$dbservice"
+            docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" up -d --wait --wait-timeout 180 "$dbservice"
+          fi
+          case "$engine" in
+            sqlite) result=$(sqlite3 "$DATA_DIR/db.sqlite3" 'SELECT value FROM ci_recovery;') ;;
+            mysql) result=$(docker exec -e MYSQL_PWD=fixture-password "$cid" mysql -u appuser appdb -N -s -e 'SELECT value FROM ci_recovery;') ;;
+            mariadb) result=$(docker exec -e MYSQL_PWD=fixture-password "$cid" mariadb -u appuser appdb -N -s -e 'SELECT value FROM ci_recovery;') ;;
+            postgresql|timescaledb) result=$(docker exec -e PGPASSWORD=fixture-password "$cid" psql -U appuser -d appdb -At -c 'SELECT value FROM ci_recovery;') ;;
+          esac
+          test "$result" = 42
+          test ! -f "$APP_DIR/backup-runtime.tsv"
+          test ! -f "$APP_DIR/backup-files.sha256"
+          docker compose -f "$COMPOSE_FILE" -p "$APP_NAME" down -v
+          echo "PASS: real $engine fresh recovery, pinned images, source removed, database state survives restart"
+          BASH
+          sudo -E bash "$RUNNER_TEMP/recovery-smoke.sh"
